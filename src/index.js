@@ -37,6 +37,8 @@ export const Config = Schema.object({
   maxImagesPerRequest: Schema.number().min(1).default(1),
   /** Model ids the cap applies to; every other model is forwarded completely untouched. Empty means every model. */
   models: Schema.array(Schema.string()).default([]),
+  /** Log the startup banner and each request that gets capped. Actual proxy errors are always logged regardless. */
+  verbose: Schema.boolean().default(false),
 })
 
 /**
@@ -53,14 +55,17 @@ export function apply(ctx, config) {
     upstreamOrigin: config.upstreamOrigin,
     maxImagesPerRequest: config.maxImagesPerRequest,
     models: config.models,
-    log: message => console.log(`[dsh-vision-3090-fix] ${message}`),
+    ...config.verbose ? { log: message => console.log(`[dsh-vision-3090-fix] ${message}`) } : {},
+    onError: message => console.error(`[dsh-vision-3090-fix] ${message}`),
   })
 
   ctx.effect(() => {
     server.listen(config.listenPort, config.listenHost)
-    const url = `http://${config.listenHost}:${config.listenPort}`
-    const scope = config.models.length > 0 ? `model(s) ${config.models.join(', ')}` : 'every model'
-    console.log(`[dsh-vision-3090-fix] proxying ${url} -> ${config.upstreamOrigin}, capping ${scope} to ${config.maxImagesPerRequest} image(s) per request`)
+    if (config.verbose) {
+      const url = `http://${config.listenHost}:${config.listenPort}`
+      const scope = config.models.length > 0 ? `model(s) ${config.models.join(', ')}` : 'every model'
+      console.log(`[dsh-vision-3090-fix] proxying ${url} -> ${config.upstreamOrigin}, capping ${scope} to ${config.maxImagesPerRequest} image(s) per request`)
+    }
     return () => {
       server.close()
     }

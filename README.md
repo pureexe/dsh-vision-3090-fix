@@ -75,6 +75,7 @@ Everything else — credentials, model list, `agent-default-model`, the Web UI's
 | `listenPort` | *(required)* | Port the proxy listens on; point your provider's `baseURL` at `http://<listenHost>:<listenPort>/v1` |
 | `maxImagesPerRequest` | `1` | Images kept per forwarded request; excess (oldest first) becomes placeholder text |
 | `models` | `[]` (every model) | Model ids the cap applies to (matched against the request's `model` field); every other model is forwarded byte-for-byte untouched |
+| `verbose` | `false` | Log the startup banner and each request that gets capped. Actual proxy errors (e.g. the upstream is unreachable) are always logged regardless — they aren't routine noise. |
 
 ## Testing
 

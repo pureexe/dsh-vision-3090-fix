@@ -219,3 +219,98 @@ test('proxy end-to-end: no models config caps every model (default, backward com
   proxy.close()
   upstream.close()
 })
+
+test('proxy: stays silent by default (no `log` supplied), even when a request is capped', async () => {
+  const { server: upstream, received } = await startFakeUpstream()
+  // No `log` in config: createProxyServer must not throw or require one.
+  const proxy = createProxyServer({ upstreamOrigin: received.origin, maxImagesPerRequest: 1 })
+  proxy.listen(0, '127.0.0.1')
+  await once(proxy, 'listening')
+  const { port } = proxy.address()
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: [imagePart('a'), imagePart('b')] }] }),
+  })
+  assert.equal(response.status, 200)
+  assert.equal(received.length, 1)
+
+  proxy.close()
+  upstream.close()
+})
+
+test('proxy: `log` is only called when explicitly supplied', async () => {
+  const { server: upstream, received } = await startFakeUpstream()
+  const logged = []
+  const proxy = createProxyServer({
+    upstreamOrigin: received.origin,
+    maxImagesPerRequest: 1,
+    log: message => logged.push(message),
+  })
+  proxy.listen(0, '127.0.0.1')
+  await once(proxy, 'listening')
+  const { port } = proxy.address()
+
+  await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: [imagePart('a'), imagePart('b')] }] }),
+  })
+  assert.equal(logged.length, 1)
+  assert.match(logged[0], /capped images/)
+
+  proxy.close()
+  upstream.close()
+})
+
+test('proxy: a downstream failure is always reported through onError, even without one supplied', async () => {
+  // Nothing is listening on this port, so the fetch to it fails.
+  const proxy = createProxyServer({ upstreamOrigin: 'http://127.0.0.1:1', maxImagesPerRequest: 1 })
+  proxy.listen(0, '127.0.0.1')
+  await once(proxy, 'listening')
+  const { port } = proxy.address()
+
+  const originalConsoleError = console.error
+  const errors = []
+  console.error = (message) => errors.push(message)
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    })
+    assert.equal(response.status, 502)
+    assert.equal(errors.length, 1)
+    assert.match(errors[0], /proxy error/)
+  } finally {
+    console.error = originalConsoleError
+    proxy.close()
+  }
+})
+
+test('proxy: a custom onError overrides the default console.error', async () => {
+  const proxy = createProxyServer({
+    upstreamOrigin: 'http://127.0.0.1:1',
+    maxImagesPerRequest: 1,
+    onError: () => {}, // swallow; proves the default console.error is not also called
+  })
+  proxy.listen(0, '127.0.0.1')
+  await once(proxy, 'listening')
+  const { port } = proxy.address()
+
+  const originalConsoleError = console.error
+  const errors = []
+  console.error = (message) => errors.push(message)
+  try {
+    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    })
+    assert.equal(errors.length, 0)
+  } finally {
+    console.error = originalConsoleError
+    proxy.close()
+  }
+})

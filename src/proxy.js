@@ -88,12 +88,14 @@ function forwardableResponseHeaders(fetchHeaders) {
  * @param config.upstreamOrigin - scheme+host+port of the real backend, e.g. `http://10.204.100.243:1234` (no path).
  * @param config.maxImagesPerRequest - images kept per forwarded request.
  * @param config.models - model ids to cap; every other model is forwarded completely untouched. Empty/omitted caps every model.
- * @param config.log - optional `(message: string) => void` for request-level diagnostics.
+ * @param config.log - optional `(message: string) => void` for routine per-request diagnostics; silent unless supplied.
+ * @param config.onError - optional `(message: string) => void` for proxy failures; defaults to `console.error` so real errors are never silent by default.
  * @returns an unstarted `http.Server`; call `.listen()` yourself.
  */
 export function createProxyServer(config) {
   const upstreamOrigin = config.upstreamOrigin.replace(/\/+$/, '')
   const modelFilter = config.models && config.models.length > 0 ? new Set(config.models) : undefined
+  const onError = config.onError ?? (message => console.error(message))
 
   return http.createServer((req, res) => {
     void (async () => {
@@ -135,7 +137,7 @@ export function createProxyServer(config) {
         }
         Readable.fromWeb(upstreamResponse.body).pipe(res)
       } catch (error) {
-        config.log?.(`vision-3090-fix: proxy error for ${targetUrl}: ${error.message}`)
+        onError(`vision-3090-fix: proxy error for ${targetUrl}: ${error.message}`)
         if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' })
         res.end(JSON.stringify({
           error: { message: `vision-3090-fix proxy error: ${error.message}`, code: 'PROXY_ERROR' },
