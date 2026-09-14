@@ -35,6 +35,8 @@ export const Config = Schema.object({
   listenPort: Schema.number().required(),
   /** Images kept per forwarded request, newest first; every older image becomes placeholder text. */
   maxImagesPerRequest: Schema.number().min(1).default(1),
+  /** Model ids the cap applies to; every other model is forwarded completely untouched. Empty means every model. */
+  models: Schema.array(Schema.string()).default([]),
 })
 
 /**
@@ -50,13 +52,15 @@ export function apply(ctx, config) {
   const server = createProxyServer({
     upstreamOrigin: config.upstreamOrigin,
     maxImagesPerRequest: config.maxImagesPerRequest,
+    models: config.models,
     log: message => console.log(`[dsh-vision-3090-fix] ${message}`),
   })
 
   ctx.effect(() => {
     server.listen(config.listenPort, config.listenHost)
     const url = `http://${config.listenHost}:${config.listenPort}`
-    console.log(`[dsh-vision-3090-fix] proxying ${url} -> ${config.upstreamOrigin}, capped to ${config.maxImagesPerRequest} image(s) per request`)
+    const scope = config.models.length > 0 ? `model(s) ${config.models.join(', ')}` : 'every model'
+    console.log(`[dsh-vision-3090-fix] proxying ${url} -> ${config.upstreamOrigin}, capping ${scope} to ${config.maxImagesPerRequest} image(s) per request`)
     return () => {
       server.close()
     }

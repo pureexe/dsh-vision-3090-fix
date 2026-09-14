@@ -149,3 +149,73 @@ test('proxy end-to-end: non-JSON requests (e.g. GET /models) are passed through 
   proxy.close()
   upstream.close()
 })
+
+test('proxy end-to-end: models config scopes the cap to specific model ids', async () => {
+  const { server: upstream, received } = await startFakeUpstream()
+  const proxy = createProxyServer({
+    upstreamOrigin: received.origin,
+    maxImagesPerRequest: 1,
+    models: ['qwen3.8-27b'],
+  })
+  proxy.listen(0, '127.0.0.1')
+  await once(proxy, 'listening')
+  const { port } = proxy.address()
+
+  const twoImages = (model) => JSON.stringify({
+    model,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'first' }, imagePart('a')] },
+      { role: 'user', content: [{ type: 'text', text: 'second' }, imagePart('b')] },
+    ],
+  })
+
+  // In scope: capped down to 1 image.
+  await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: twoImages('qwen3.8-27b'),
+  })
+  const cappedRequest = JSON.parse(received[0].body)
+  const cappedImages = cappedRequest.messages.flatMap(m => m.content.filter(p => p.type === 'image_url'))
+  assert.equal(cappedImages.length, 1)
+
+  // Out of scope: forwarded with both images, completely untouched.
+  await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: twoImages('meta/muse-glimmer'),
+  })
+  assert.equal(received[1].body, twoImages('meta/muse-glimmer'))
+  const untouchedRequest = JSON.parse(received[1].body)
+  const untouchedImages = untouchedRequest.messages.flatMap(m => m.content.filter(p => p.type === 'image_url'))
+  assert.equal(untouchedImages.length, 2)
+
+  proxy.close()
+  upstream.close()
+})
+
+test('proxy end-to-end: no models config caps every model (default, backward compatible)', async () => {
+  const { server: upstream, received } = await startFakeUpstream()
+  const proxy = createProxyServer({ upstreamOrigin: received.origin, maxImagesPerRequest: 1 })
+  proxy.listen(0, '127.0.0.1')
+  await once(proxy, 'listening')
+  const { port } = proxy.address()
+
+  await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'meta/muse-glimmer',
+      messages: [
+        { role: 'user', content: [imagePart('a')] },
+        { role: 'user', content: [imagePart('b')] },
+      ],
+    }),
+  })
+  const forwarded = JSON.parse(received[0].body)
+  const images = forwarded.messages.flatMap(m => m.content.filter(p => p.type === 'image_url'))
+  assert.equal(images.length, 1)
+
+  proxy.close()
+  upstream.close()
+})

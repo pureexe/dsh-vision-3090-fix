@@ -44,7 +44,10 @@ Configure it in your profile's `cordis.patch.yml` (e.g. `~/.dsh/profiles/web/cor
     listenHost: 127.0.0.1
     listenPort: 8931
     maxImagesPerRequest: 1                        # match your server's --limit-mm-per-prompt
+    models: [qwen3.8-27b]                         # optional; omit to cap every model
 ```
+
+`baseURL` in `dsh-llm-pi-ai` is set once **per provider**, not per model — every model listed under that one provider shares it. So if `pure` serves three models and you point its `baseURL` at this proxy, all three now go through the proxy, even though only one of them needs the cap. `models` (optional; empty means "cap everything") scopes *the cap itself*, not the routing: out-of-scope requests still take the extra local hop through the proxy, but are forwarded completely untouched — same bytes in, same bytes out, no behavior change from talking to the backend directly.
 
 Then point your **existing** provider config at the proxy instead of the real backend — the only line that changes. For a `dsh-llm-pi-ai` route in `settings.yaml`:
 
@@ -71,6 +74,7 @@ Everything else — credentials, model list, `agent-default-model`, the Web UI's
 | `listenHost` | `127.0.0.1` | Host the proxy listens on |
 | `listenPort` | *(required)* | Port the proxy listens on; point your provider's `baseURL` at `http://<listenHost>:<listenPort>/v1` |
 | `maxImagesPerRequest` | `1` | Images kept per forwarded request; excess (oldest first) becomes placeholder text |
+| `models` | `[]` (every model) | Model ids the cap applies to (matched against the request's `model` field); every other model is forwarded byte-for-byte untouched |
 
 ## Testing
 

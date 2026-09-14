@@ -87,11 +87,13 @@ function forwardableResponseHeaders(fetchHeaders) {
  * Create (but do not start) the proxy's `http.Server`.
  * @param config.upstreamOrigin - scheme+host+port of the real backend, e.g. `http://10.204.100.243:1234` (no path).
  * @param config.maxImagesPerRequest - images kept per forwarded request.
+ * @param config.models - model ids to cap; every other model is forwarded completely untouched. Empty/omitted caps every model.
  * @param config.log - optional `(message: string) => void` for request-level diagnostics.
  * @returns an unstarted `http.Server`; call `.listen()` yourself.
  */
 export function createProxyServer(config) {
   const upstreamOrigin = config.upstreamOrigin.replace(/\/+$/, '')
+  const modelFilter = config.models && config.models.length > 0 ? new Set(config.models) : undefined
 
   return http.createServer((req, res) => {
     void (async () => {
@@ -108,13 +110,14 @@ export function createProxyServer(config) {
           } catch {
             payload = undefined
           }
-          if (payload !== undefined && Array.isArray(payload.messages)) {
+          const inScope = payload !== undefined && (modelFilter === undefined || modelFilter.has(payload.model))
+          if (inScope && Array.isArray(payload.messages)) {
             const before = payload.messages
             const after = capImagesInMessages(before, config.maxImagesPerRequest)
             if (after !== before) {
               payload = { ...payload, messages: after }
               forwardBody = Buffer.from(JSON.stringify(payload))
-              config.log?.(`vision-3090-fix: capped images in request to ${targetUrl.pathname}`)
+              config.log?.(`vision-3090-fix: capped images in request for model "${payload.model}" to ${targetUrl.pathname}`)
             }
           }
         }
