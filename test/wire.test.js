@@ -127,6 +127,60 @@ test('tool-result messages become their own `tool` wire message', async () => {
   assert.equal(wire[0].content, 'file contents')
 })
 
+test('a tool-result image is sent as real image content, not stripped to text', async () => {
+  const result = createToolResultMessage({
+    callId: 'call-screenshot',
+    content: [{ type: 'image', attachment: imageRef('sha256:screenshot') }],
+    isError: false,
+  })
+  const attachments = fakeAttachments()
+  const wire = await buildWireMessages([result], {
+    attachments,
+    imagePolicy: { maxPixels: 4194304, maxBytes: 1048576 },
+    maxImagesPerRequest: 1,
+  })
+  assert.equal(wire.length, 1)
+  assert.equal(wire[0].role, 'tool')
+  assert.equal(wire[0].tool_call_id, 'call-screenshot')
+  assert.ok(Array.isArray(wire[0].content))
+  const imageParts = wire[0].content.filter(part => part.type === 'image_url')
+  assert.equal(imageParts.length, 1)
+  assert.match(imageParts[0].image_url.url, /^data:image\/png;base64,/)
+})
+
+test('two tool calls in one turn each returning an image: only the newest reaches the wire', async () => {
+  // Mirrors the reported case: a screen_shot tool call and a filesystem_pull
+  // tool call each return one image before the next model turn.
+  const screenshot = createToolResultMessage({
+    callId: 'call-screenshot',
+    content: [{ type: 'image', attachment: imageRef('sha256:screenshot') }],
+    isError: false,
+  })
+  const pulledFile = createToolResultMessage({
+    callId: 'call-pull',
+    content: [{ type: 'image', attachment: imageRef('sha256:pulled-file') }],
+    isError: false,
+  })
+  const attachments = fakeAttachments()
+  const wire = await buildWireMessages([screenshot, pulledFile], {
+    attachments,
+    imagePolicy: { maxPixels: 4194304, maxBytes: 1048576 },
+    maxImagesPerRequest: 1,
+  })
+
+  const allImageParts = wire.flatMap(m => (Array.isArray(m.content) ? m.content.filter(p => p.type === 'image_url') : []))
+  assert.equal(allImageParts.length, 1)
+  assert.deepEqual(attachments.calls, ['sha256:pulled-file'])
+
+  const screenshotWire = wire.find(m => m.tool_call_id === 'call-screenshot')
+  assert.equal(typeof screenshotWire.content, 'string')
+  assert.match(screenshotWire.content, /image omitted/)
+
+  const pulledWire = wire.find(m => m.tool_call_id === 'call-pull')
+  assert.ok(Array.isArray(pulledWire.content))
+  assert.ok(pulledWire.content.some(part => part.type === 'image_url'))
+})
+
 test('system-role history text is forwarded as a system wire message', async () => {
   const system = { role: 'system', content: [{ type: 'text', text: 'be nice' }], id: 's1', source: { kind: 'plugin', plugin: 'x' } }
   const user = createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })

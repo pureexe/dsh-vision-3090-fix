@@ -16,21 +16,18 @@ function flattenText(content) {
     .join('')
 }
 
-/** Recursively flatten a tool-result's content to plain text; nested images become a note. */
-function toolResultText(content) {
-  return content.map((block) => {
-    if (block.type === 'text' || block.type === 'reasoning') return block.text
-    if (block.type === 'tool-result') return toolResultText(block.content)
-    if (block.type === 'image') return '[image omitted: tool-result images are not sent by this adapter]'
-    return ''
-  }).join('')
-}
-
-/** Convert one user-role message's non-tool-result blocks into OpenAI content. */
-async function userContent(blocks, attachments, imagePolicy, signal) {
+/**
+ * Convert a block list (a message's content, or one tool-result's nested
+ * content) into OpenAI content: a plain string when it is text-only, or a
+ * content-part array once any image survives the request-wide image cap.
+ * Nested tool-result blocks are flattened in place, so an image returned by
+ * a tool (a screenshot, a pulled file) is treated exactly like a directly
+ * attached one: it counts toward, and can be kept by, `maxImagesPerRequest`.
+ */
+async function blocksToWireContent(blocks, attachments, imagePolicy, signal) {
   const parts = []
   for (const block of blocks) {
-    if (block.type === 'text') {
+    if (block.type === 'text' || block.type === 'reasoning') {
       if (block.text.length > 0) parts.push({ type: 'text', text: block.text })
       continue
     }
@@ -40,7 +37,16 @@ async function userContent(blocks, attachments, imagePolicy, signal) {
       parts.push({ type: 'image_url', image_url: { url: `data:${version.mediaType};base64,${base64}` } })
       continue
     }
-    // Other merge-extensible blocks are not user-input wire vocabulary here.
+    if (block.type === 'tool-result') {
+      const nested = await blocksToWireContent(block.content, attachments, imagePolicy, signal)
+      if (typeof nested === 'string') {
+        if (nested.length > 0) parts.push({ type: 'text', text: nested })
+      } else {
+        parts.push(...nested)
+      }
+      continue
+    }
+    // Other merge-extensible blocks are not wire vocabulary here.
   }
   if (parts.length === 0) return ''
   if (parts.every(part => part.type === 'text')) return parts.map(part => part.text).join('')
@@ -64,8 +70,9 @@ function assistantToWire(message) {
 
 /**
  * Build the OpenAI-compatible `messages` array for one request, replacing
- * every image beyond `maxImagesPerRequest` (oldest first) with stable text so
- * a single-image-per-prompt backend never receives more than it accepts.
+ * every image beyond `maxImagesPerRequest` (oldest first, tool-result images
+ * included) with stable text so a single-image-per-prompt backend never
+ * receives more than it accepts.
  * @param messages - Harness request history, oldest first.
  * @param options.attachments - `ctx.attachments`-shaped store resolving image bytes.
  * @param options.imagePolicy - `{ maxPixels, maxBytes }` passed to `readImageRequest`.
@@ -91,19 +98,21 @@ export async function buildWireMessages(messages, { attachments, imagePolicy, ma
       wire.push(assistantToWire(message))
       continue
     }
-    // role === 'user': tool-result blocks become their own `tool` messages;
-    // everything else becomes one `user` message.
+    // role === 'user': tool-result blocks become their own `tool` messages
+    // (a returned image is kept, subject to the same cap above); everything
+    // else becomes one `user` message.
     const toolResults = message.content.filter(block => block.type === 'tool-result')
     const regular = message.content.filter(block => block.type !== 'tool-result')
     if (regular.length > 0 || toolResults.length === 0) {
-      const content = await userContent(regular, attachments, imagePolicy, signal)
+      const content = await blocksToWireContent(regular, attachments, imagePolicy, signal)
       wire.push({ role: 'user', content })
     }
     for (const result of toolResults) {
+      const content = await blocksToWireContent(result.content, attachments, imagePolicy, signal)
       wire.push({
         role: 'tool',
         tool_call_id: result.toolCallId,
-        content: toolResultText(result.content) || '(no output)',
+        content: content === '' ? '(no output)' : content,
       })
     }
   }

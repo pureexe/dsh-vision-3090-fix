@@ -118,7 +118,7 @@ That test first reproduces the reported 400 with an uncapped request, then prove
 
 ## Known limitations
 
-- Images nested inside tool-result content are dropped to text placeholders, not sent — this adapter targets the common chat/vision path, not tool-returned images.
+- Images returned by a tool call (a screenshot, a pulled file) are treated the same as a directly attached image and count toward `maxImagesPerRequest`; they are sent as real `image_url` content inside the `tool` role message, which this specific backend accepts, but this is not a universal part of the OpenAI `tool` message spec — verify it against your own server if you rely on it.
 - `reasoning_effort` is sent as a best-effort `reasoning_effort` wire field using each model's configured spelling; there is no universal OpenAI-compatible convention for this, so verify it against your server's chat template.
 - No retry logic — a transient provider failure surfaces once as an `LlmError`, same contract every Harness adapter is expected to meet (`dsh-llm-retry` re-runs failed requests at the agent-step boundary if mounted).
 - `GenerateOptions.stop` is passed straight through as `stop`; not every backend honors it identically.
