@@ -1,0 +1,26 @@
+# Applied to any profile that lists this bundle (`dsh plugin add`).
+#
+# baseURL has no default and validation fails loudly until you set it, so
+# replace the placeholder below with your server, or override this whole row
+# by `id` in your profile's own cordis.patch.yml / $DSH_HOME/cordis.patch.yml
+# (a later layer replaces the entire `config`, not just the changed key).
+- insert:
+    - id: vision-3090-fix
+      name: dsh-vision-3090-fix
+      config:
+        providers: [pure]
+        baseURL: http://127.0.0.1:1234/v1
+        apiKeyEnv: PURE_API_KEY
+        maxImagesPerRequest: 1
+        models:
+          - id: qwen3.8-27b
+            name: qwen3.8-27b
+            contextWindow: 131072
+            maxTokens: 16384
+            input: [text, image]
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+            defaultReasoningEffort: medium
