@@ -1,7 +1,7 @@
 {
   "name": "dsh-vision-3090-fix",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness LLM adapter that caps images per request to 1, for self-hosted vLLM backends that reject prompts with more than one image",
+  "version": "0.2.0",
+  "description": "Local reverse proxy plugin for DeepSeek Harness that caps images per request to 1, for self-hosted vLLM backends that reject prompts with more than one image",
   "type": "module",
   "main": "src/index.js",
   "files": [
@@ -22,17 +22,12 @@
     "test": "node --test test/"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-attachment": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-llm": "0.1.5-rc.2"
+    "@deepseek-ai/cordis": "^4.0.2"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.2",
-    "eventsource-parser": "^3.1.1"
+    "@deepseek-ai/schemastery": "^3.18.2"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "4.0.2",
-    "@deepseek-ai/dsh-attachment": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-llm": "0.1.5-rc.2"
+    "@deepseek-ai/cordis": "4.0.2"
   }
 }

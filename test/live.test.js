@@ -1,10 +1,11 @@
 /**
- * End-to-end test against the real backend from the bug report. Skipped
- * unless VISION_3090_FIX_LIVE_BASE_URL is set, since it needs network access
- * to a specific vLLM server and a real API key.
+ * End-to-end test against the real backend from the bug report, through an
+ * actual instance of this proxy. Skipped unless VISION_3090_FIX_LIVE_UPSTREAM
+ * is set, since it needs network access to a specific vLLM server and a real
+ * API key.
  *
  * Run with:
- *   VISION_3090_FIX_LIVE_BASE_URL=http://10.204.100.243:1234/v1 \
+ *   VISION_3090_FIX_LIVE_UPSTREAM=http://10.204.100.243:1234 \
  *   VISION_3090_FIX_LIVE_API_KEY=<your-api-key> \
  *   VISION_3090_FIX_LIVE_MODEL=qwen3.8-27b \
  *   VISION_3090_FIX_LIVE_IMAGE=/home/pakkapon/a.png \
@@ -13,155 +14,71 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
-import { createUserMessage, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
-import { Vision3090Adapter } from '../src/adapter.js'
+import { once } from 'node:events'
+import { createProxyServer } from '../src/proxy.js'
 
-const baseURL = process.env.VISION_3090_FIX_LIVE_BASE_URL
+const upstreamOrigin = process.env.VISION_3090_FIX_LIVE_UPSTREAM
 const apiKey = process.env.VISION_3090_FIX_LIVE_API_KEY
 const model = process.env.VISION_3090_FIX_LIVE_MODEL ?? 'qwen3.8-27b'
 const imagePath = process.env.VISION_3090_FIX_LIVE_IMAGE ?? '/home/pakkapon/a.png'
 
-const shouldRun = baseURL !== undefined && apiKey !== undefined
+const shouldRun = upstreamOrigin !== undefined && apiKey !== undefined
 
-test('reproduces the reported bug directly against the real vLLM server', { skip: !shouldRun }, async () => {
+async function startProxy(maxImagesPerRequest) {
+  const server = createProxyServer({ upstreamOrigin, maxImagesPerRequest })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const { port } = server.address()
+  return { server, baseURL: `http://127.0.0.1:${port}/v1` }
+}
+
+async function chatWithImages(baseURL, imageCount) {
   const bytes = await fs.readFile(imagePath)
-  const attachments = {
-    async readImageRequest(ref) {
-      return { data: bytes, mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 }
-    },
+  const b64 = bytes.toString('base64')
+  const image = { type: 'image_url', image_url: { url: `data:image/png;base64,${b64}` } }
+  const messages = []
+  for (let i = 0; i < imageCount; i += 1) {
+    messages.push({ role: 'user', content: [{ type: 'text', text: `image ${i + 1}` }, image] })
+    if (i < imageCount - 1) messages.push({ role: 'assistant', content: 'ok' })
   }
+  const response = await fetch(`${baseURL}/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ model, messages, max_tokens: 64 }),
+  })
+  const body = await response.json()
+  return { status: response.status, body }
+}
 
-  // No cap at all (maxImagesPerRequest effectively unbounded): this is what
-  // ships today and is exactly what produced the reported 400.
-  const uncapped = new Vision3090Adapter(attachments, {
-    baseURL,
-    apiKey,
-    maxImagesPerRequest: Number.MAX_SAFE_INTEGER,
-    defaultContextWindow: 131072,
-    defaultMaxTokens: 64,
-    requestImagePixelBudget: 4194304,
-    requestImageMaxBytes: 1048576,
-    models: [],
-  })
-
-  const first = createUserMessage({
-    content: [{ type: 'text', text: 'First image.' }, { type: 'image', attachment: { attachmentId: 'sha256:a', mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 } }],
-    source: { kind: 'user' },
-  })
-  const reply = createAssistantMessage({
-    content: [{ type: 'text', text: 'ok' }],
-    source: { provider: 'pure', model },
-  })
-  const second = createUserMessage({
-    content: [{ type: 'text', text: 'Second image, what changed?' }, { type: 'image', attachment: { attachmentId: 'sha256:b', mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 } }],
-    source: { kind: 'user' },
-  })
-
-  await assert.rejects(async () => {
-    for await (const _chunk of uncapped.stream({ provider: 'pure', model, messages: [first, reply, second], maxTokens: 16 })) {
-      // draining the stream is enough to surface the thrown LlmError
-    }
-  }, (error) => {
-    assert.match(error.message, /At most 1 image/)
-    return true
-  })
+test('without the proxy fix (cap effectively unbounded), two images reproduces the reported 400', { skip: !shouldRun }, async () => {
+  const { server, baseURL } = await startProxy(Number.MAX_SAFE_INTEGER)
+  try {
+    const { status, body } = await chatWithImages(baseURL, 2)
+    assert.equal(status, 400)
+    assert.match(body.error.message, /At most 1 image/)
+  } finally {
+    server.close()
+  }
 })
 
-test('the fix: capping to 1 image lets the same two-image conversation succeed', { skip: !shouldRun }, async () => {
-  const bytes = await fs.readFile(imagePath)
-  const attachments = {
-    async readImageRequest() {
-      return { data: bytes, mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 }
-    },
+test('the fix: proxying through a 1-image cap lets the same two-image conversation succeed', { skip: !shouldRun }, async () => {
+  const { server, baseURL } = await startProxy(1)
+  try {
+    const { status, body } = await chatWithImages(baseURL, 2)
+    assert.equal(status, 200)
+    assert.ok(body.choices?.[0])
+  } finally {
+    server.close()
   }
-
-  const fixed = new Vision3090Adapter(attachments, {
-    baseURL,
-    apiKey,
-    maxImagesPerRequest: 1,
-    defaultContextWindow: 131072,
-    defaultMaxTokens: 64,
-    requestImagePixelBudget: 4194304,
-    requestImageMaxBytes: 1048576,
-    models: [],
-  })
-
-  const first = createUserMessage({
-    content: [{ type: 'text', text: 'First image.' }, { type: 'image', attachment: { attachmentId: 'sha256:a', mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 } }],
-    source: { kind: 'user' },
-  })
-  const reply = createAssistantMessage({
-    content: [{ type: 'text', text: 'ok' }],
-    source: { provider: 'pure', model },
-  })
-  const second = createUserMessage({
-    content: [{ type: 'text', text: 'Second image, what changed?' }, { type: 'image', attachment: { attachmentId: 'sha256:b', mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 } }],
-    source: { kind: 'user' },
-  })
-
-  const chunks = []
-  for await (const chunk of fixed.stream({ provider: 'pure', model, messages: [first, reply, second], maxTokens: 64 })) {
-    chunks.push(chunk)
-  }
-
-  const finish = chunks.at(-1)
-  assert.equal(finish.type, 'finish')
-  // A reasoning model may spend the whole budget thinking before any visible
-  // text ('max-tokens'), or answer and stop normally ('stop'); either is a
-  // real 200 OK response, proving the request no longer gets the reported
-  // "At most 1 image(s)" 400. What must never happen is 'error'.
-  assert.notEqual(finish.reason.kind, 'error')
-  assert.ok(chunks.some(c => c.type === 'usage'))
 })
 
-test('two tool calls in one turn each returning an image succeeds against the real backend', { skip: !shouldRun }, async () => {
-  const bytes = await fs.readFile(imagePath)
-  const attachments = {
-    async readImageRequest() {
-      return { data: bytes, mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 }
-    },
+test('a single image passes through the proxy untouched and still works', { skip: !shouldRun }, async () => {
+  const { server, baseURL } = await startProxy(1)
+  try {
+    const { status, body } = await chatWithImages(baseURL, 1)
+    assert.equal(status, 200)
+    assert.ok(body.choices?.[0])
+  } finally {
+    server.close()
   }
-  const fixed = new Vision3090Adapter(attachments, {
-    baseURL,
-    apiKey,
-    maxImagesPerRequest: 1,
-    defaultContextWindow: 131072,
-    defaultMaxTokens: 64,
-    requestImagePixelBudget: 4194304,
-    requestImageMaxBytes: 1048576,
-    models: [],
-  })
-
-  const priorCall = createAssistantMessage({
-    content: [
-      { type: 'tool-call', id: 'call-screenshot', name: 'screen_shot', arguments: '{}' },
-      { type: 'tool-call', id: 'call-pull', name: 'filesystem_pull', arguments: '{}' },
-    ],
-    source: { provider: 'pure', model },
-  })
-  const screenshot = createToolResultMessage({
-    callId: 'call-screenshot',
-    content: [{ type: 'image', attachment: { attachmentId: 'sha256:screenshot', mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 } }],
-    isError: false,
-  })
-  const pulledFile = createToolResultMessage({
-    callId: 'call-pull',
-    content: [{ type: 'image', attachment: { attachmentId: 'sha256:pulled', mediaType: 'image/png', bytes: bytes.length, width: 1, height: 1 } }],
-    isError: false,
-  })
-  const ask = createUserMessage({ content: [{ type: 'text', text: 'What do you see in the most recent image?' }], source: { kind: 'user' } })
-
-  const chunks = []
-  for await (const chunk of fixed.stream({
-    provider: 'pure',
-    model,
-    messages: [priorCall, screenshot, pulledFile, ask],
-    maxTokens: 64,
-  })) {
-    chunks.push(chunk)
-  }
-  const finish = chunks.at(-1)
-  assert.equal(finish.type, 'finish')
-  assert.notEqual(finish.reason.kind, 'error')
-  assert.ok(chunks.some(c => c.type === 'usage'))
 })

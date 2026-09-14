@@ -6,122 +6,96 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) pl
 400: {"message":"At most 1 image(s) may be provided in one prompt. (parameter=image)","type":"BadRequestError","param":"image","code":400}
 ```
 
-against a self-hosted OpenAI-compatible vision backend (e.g. [syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090), a single-RTX-3090 vLLM deployment). vLLM serves these models with `--limit-mm-per-prompt image=1`, so **any** request carrying more than one image content part is rejected with a 400 — even across unrelated turns of the same conversation.
+against a self-hosted OpenAI-compatible vision backend (e.g. [syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090), a single-RTX-3090 vLLM deployment). vLLM serves these models with `--limit-mm-per-prompt image=1`, so **any** request carrying more than one image content part is rejected with a 400 — even across unrelated turns of the same conversation, and even across separate tool calls (e.g. a screenshot tool and a file-pull tool each returning one image) in the same turn.
 
 ## Why this happens
 
-Harness's shipped LLM adapters (`dsh-llm-pi-ai`, `dsh-llm-deepseek`) only offload images by **accumulated byte size** (`maxRequestImageBytes` / `requestImageMaxBytes`). They never cap by **count**. So a two-turn conversation where you attach one small image, get a reply, and then attach a second small image sends **both** images in the third request — comfortably under any byte budget, but two images, which this backend refuses outright.
-
-This was confirmed directly against the backend (see [`test/live.test.js`](test/live.test.js)):
-
-```
-$ curl -X POST http://10.204.100.243:1234/v1/chat/completions ... # 1 image  -> 200 OK
-$ curl -X POST http://10.204.100.243:1234/v1/chat/completions ... # 2 images -> 400 "At most 1 image(s) may be provided in one prompt."
-```
+Harness's shipped LLM adapters (`dsh-llm-pi-ai`, `dsh-llm-deepseek`) only offload images by **accumulated byte size** (`maxRequestImageBytes` / `requestImageMaxBytes`). They never cap by **count**. So a conversation where you attach one small image, get a reply, and then attach a second small image sends **both** images in the next request — comfortably under any byte budget, but two images, which this backend refuses outright.
 
 ## What this plugin does
 
-It's a small, self-contained `LlmAdapter` (see [`docs/user/develop/practice/llm-adapter.md`](https://deepseek-harness.github.io/deepseek-harness/) in the harness docs) that speaks the OpenAI-compatible `chat/completions` wire protocol directly:
+It's a small local HTTP reverse proxy, started as an ordinary Cordis plugin effect (see `docs/user/develop/basic/index.md#automatic-cleanup` in the harness docs — `ctx.effect()` starts and stops it with the plugin's lifecycle). You put it **in front of** your existing provider's `baseURL`; everything else about how you already talk to the backend — `dsh-llm-pi-ai`'s `pure` provider, its model list, its credential — stays exactly as configured.
 
-1. Before building the wire request, it calls Harness's own exported
-   `offloadRequestImagesWithPolicy()` (from `@deepseek-ai/dsh-llm`) with a
-   **count** budget — `maxImages: maxImagesPerRequest` (default `1`) — keeping
-   only the newest image(s) and replacing every older one with the same
-   stable placeholder text (`offloadedImageText`) the built-in byte-based
-   offload uses. This is the one behavior gap it closes; everything else is a
-   direct, minimal implementation of the wire protocol so the fix has as
-   little surface area as possible.
-2. It converts the resulting history into OpenAI-compatible `messages`
-   (text, `image_url` data URIs, assistant `tool_calls`, `tool` role
-   messages).
-3. It streams the response (SSE) and translates it into Harness's
-   `StreamChunk` protocol, including `reasoning_content`, tool calls, and
-   usage (mirroring the same wire shapes `dsh-llm-deepseek` handles).
+For each forwarded request, the proxy:
+
+1. Parses the JSON body's `messages` array (standard OpenAI wire format).
+2. Counts every `image_url` content part across the whole array, including ones nested in `tool`-role messages (a returned screenshot, a pulled file).
+3. Replaces every one beyond the newest `maxImagesPerRequest` (default `1`) with a stable text placeholder, in place.
+4. Forwards the request — headers (including `Authorization`, untouched — the proxy never needs or sees your API key's meaning, just passes it through) and the rewritten body — to the real backend.
+5. Streams the response straight back, byte for byte, so SSE streaming works exactly as it would talking to the backend directly (verified: chunks arrive incrementally, not buffered).
+
+A request already at or under the cap is forwarded completely unmodified.
 
 ## Install
-
-This plugin **replaces** the adapter for one provider route — it cannot be mounted alongside another adapter that registers the same route name (Harness rejects duplicate route registration). If you currently reach this backend through `dsh-llm-pi-ai`'s `pure` provider (as in the original bug report), remove that provider block from your `llm-pi-ai:` settings section first.
-
-### 1. Add the plugin to your profile
 
 ```sh
 dsh plugin --profile web add /path/to/dsh-vision-3090-fix
 ```
 
-(or `dsh plugin --profile web add github:<you>/dsh-vision-3090-fix` once pushed).
+(or `dsh plugin --profile web add github:pureexe/dsh-vision-3090-fix` once pushed).
 
-### 2. Configure it
-
-Edit your profile's `cordis.patch.yml` (e.g. `~/.dsh/profiles/web/cordis.patch.yml`) — this bundle's own `cordis.patch.yml` ships a placeholder row; override it by `id`, restating the whole config:
+Configure it in your profile's `cordis.patch.yml` (e.g. `~/.dsh/profiles/web/cordis.patch.yml`):
 
 ```yaml
 - id: vision-3090-fix
   name: dsh-vision-3090-fix
   config:
-    providers: [pure]                       # route name(s) this adapter owns
-    baseURL: http://10.204.100.243:1234/v1
-    apiKeyEnv: PURE_API_KEY                  # set this env var before starting dsh
-    maxImagesPerRequest: 1                   # match your server's --limit-mm-per-prompt
-    models:
-      - id: qwen3.8-27b
-        name: qwen3.8-27b
-        contextWindow: 131072
-        maxTokens: 16384
-        input: [text, image]
-        reasoningEfforts:
-          low: low
-          medium: medium
-          high: high
-          xhigh: xhigh
-        defaultReasoningEffort: medium
+    upstreamOrigin: http://10.204.100.243:1234   # scheme+host+port only, no path
+    listenHost: 127.0.0.1
+    listenPort: 8931
+    maxImagesPerRequest: 1                        # match your server's --limit-mm-per-prompt
 ```
 
-Set the referenced environment variable (`PURE_API_KEY` above) before launching `dsh`. A literal `apiKey: "..."` field also works, but keeping the secret out of `cordis.yml`/patch files is preferred.
+Then point your **existing** provider config at the proxy instead of the real backend — the only line that changes. For a `dsh-llm-pi-ai` route in `settings.yaml`:
 
-### 3. Point your default model at the route (if needed)
+```yaml
+llm-pi-ai:
+  providers:
+    pure:
+      displayName: pure
+      apiKeyEnv: PURE_API_KEY
+      api: openai-completions
+      baseURL: http://127.0.0.1:8931/v1   # was: http://10.204.100.243:1234/v1
+      models:
+        - id: qwen3.8-27b
+          # ...unchanged
+```
 
-`agent-default-model.provider: pure` in `settings.yaml` keeps working unchanged, since routing is by route name, not by which adapter owns it.
+Everything else — credentials, model list, `agent-default-model`, the Web UI's Models settings page — keeps working exactly as it did before, because `dsh-llm-pi-ai` still owns the `pure` route and is still the thing editing/reading that section. The proxy is invisible to it beyond the URL.
 
 ## Configuration reference
 
 | Field | Default | Meaning |
 |---|---|---|
-| `providers` | `['pure']` | Route name(s) this adapter registers for |
-| `baseURL` | *(required)* | Base URL of the OpenAI-compatible server |
-| `apiKey` | — | Literal API key |
-| `apiKeyEnv` | — | Env var read once at plugin load for the API key |
-| `maxImagesPerRequest` | `1` | Images kept per request; excess (oldest first) becomes placeholder text |
-| `defaultContextWindow` | `131072` | Context window for a model id absent from `models` |
-| `defaultMaxTokens` | `16384` | Output cap for a model id absent from `models` |
-| `requestImagePixelBudget` | `4194304` | Total-pixel budget applied when resolving one image's request bytes |
-| `requestImageMaxBytes` | `1048576` | Encoded-byte target applied when resolving one image's request bytes |
-| `models` | `[]` | Static model catalog: `id`, `name`, `contextWindow`, `maxTokens`, `input`, `reasoningEfforts`, `defaultReasoningEffort` |
+| `upstreamOrigin` | *(required)* | Scheme+host+port of the real backend, e.g. `http://10.204.100.243:1234` — no path |
+| `listenHost` | `127.0.0.1` | Host the proxy listens on |
+| `listenPort` | *(required)* | Port the proxy listens on; point your provider's `baseURL` at `http://<listenHost>:<listenPort>/v1` |
+| `maxImagesPerRequest` | `1` | Images kept per forwarded request; excess (oldest first) becomes placeholder text |
 
 ## Testing
 
 ```sh
 npm install
-npm test                # unit tests only (no network)
+npm test                # unit + local end-to-end tests (fake upstream, no network)
 ```
 
-To also run the end-to-end test against a real backend:
+To also run the end-to-end test against the real backend:
 
 ```sh
-VISION_3090_FIX_LIVE_BASE_URL=http://10.204.100.243:1234/v1 \
+VISION_3090_FIX_LIVE_UPSTREAM=http://10.204.100.243:1234 \
 VISION_3090_FIX_LIVE_API_KEY=<your-api-key> \
 VISION_3090_FIX_LIVE_MODEL=qwen3.8-27b \
 VISION_3090_FIX_LIVE_IMAGE=/home/pakkapon/a.png \
 node --test test/live.test.js
 ```
 
-That test first reproduces the reported 400 with an uncapped request, then proves the same two-image conversation succeeds once capped to 1 image.
+That test starts a real instance of the proxy, first proves an uncapped two-image conversation gets the reported 400 from the real backend, then proves the same conversation succeeds once proxied through a 1-image cap.
 
 ## Known limitations
 
-- Images returned by a tool call (a screenshot, a pulled file) are treated the same as a directly attached image and count toward `maxImagesPerRequest`; they are sent as real `image_url` content inside the `tool` role message, which this specific backend accepts, but this is not a universal part of the OpenAI `tool` message spec — verify it against your own server if you rely on it.
-- `reasoning_effort` is sent as a best-effort `reasoning_effort` wire field using each model's configured spelling; there is no universal OpenAI-compatible convention for this, so verify it against your server's chat template.
-- No retry logic — a transient provider failure surfaces once as an `LlmError`, same contract every Harness adapter is expected to meet (`dsh-llm-retry` re-runs failed requests at the agent-step boundary if mounted).
-- `GenerateOptions.stop` is passed straight through as `stop`; not every backend honors it identically.
+- Buffers the request body fully before forwarding (needed to parse and rewrite JSON); fine for chat/vision payloads, not meant for large file uploads. The response is streamed through without buffering.
+- No retry logic and no request queuing — it's a thin pass-through, not a load balancer.
+- Assumes the backend is plain HTTP/HTTPS `chat/completions`-shaped JSON; a provider using a different wire shape for images (not OpenAI's `image_url` content part) won't be recognized.
 
 ## License
 
