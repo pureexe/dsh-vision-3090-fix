@@ -314,3 +314,65 @@ test('proxy: a custom onError overrides the default console.error', async () => 
     proxy.close()
   }
 })
+
+test('proxy: a stalled upstream response (idle past requestTimeoutMs) ends that request without crashing the server', async () => {
+  // Reproduces the reported crash: upstream sends headers for a streaming
+  // response, then goes idle. Previously this threw an uncaught 'error'
+  // event during .pipe() and killed the whole process.
+  const stalling = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.flushHeaders() // send the head now, without waiting for a body write
+    // Deliberately never write a body chunk or call res.end() — the
+    // connection just sits open, exactly like a stalled generation.
+  })
+  stalling.listen(0, '127.0.0.1')
+  await once(stalling, 'listening')
+  const stallingOrigin = `http://127.0.0.1:${stalling.address().port}`
+
+  const proxy = createProxyServer({
+    upstreamOrigin: stallingOrigin,
+    maxImagesPerRequest: 1,
+    requestTimeoutMs: 100,
+  })
+  proxy.listen(0, '127.0.0.1')
+  await once(proxy, 'listening')
+  const { port } = proxy.address()
+
+  const uncaughtExceptions = []
+  const onUncaught = (error) => uncaughtExceptions.push(error)
+  process.on('uncaughtException', onUncaught)
+
+  try {
+    // Exactly how the client observes the failure (a resolved response whose
+    // body then errors, vs. a socket reset that fails fetch() itself) depends
+    // on timing neither side controls; what must hold either way is that it
+    // *fails* instead of hanging forever, and does so without an uncaught
+    // exception anywhere in this process.
+    await assert.rejects(async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'x', messages: [] }),
+      })
+      await response.text()
+    })
+
+    // Give any stray async error a tick to surface before asserting none did.
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.deepEqual(uncaughtExceptions, [])
+
+    // The server itself must still be alive and able to serve another request.
+    const { server: upstream, received } = await startFakeUpstream()
+    const proxy2 = createProxyServer({ upstreamOrigin: received.origin, maxImagesPerRequest: 1 })
+    proxy2.listen(0, '127.0.0.1')
+    await once(proxy2, 'listening')
+    const healthyResponse = await fetch(`http://127.0.0.1:${proxy2.address().port}/v1/models`)
+    assert.equal(healthyResponse.status, 200)
+    proxy2.close()
+    upstream.close()
+  } finally {
+    process.removeListener('uncaughtException', onUncaught)
+    proxy.close()
+    stalling.close()
+  }
+})

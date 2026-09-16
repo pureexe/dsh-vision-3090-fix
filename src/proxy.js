@@ -11,9 +11,14 @@
 
 import http from 'node:http'
 import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { Agent } from 'undici'
 
 /** Stable placeholder text for an image dropped by the count cap. */
 export const OMITTED_IMAGE_TEXT = '[image omitted: capped to the newest image(s) this backend accepts]'
+
+/** undici's own default; used here so `requestTimeoutMs` is unset-compatible. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 300_000
 
 /**
  * Replace every `image_url` content part beyond the newest `maxImages`
@@ -88,6 +93,7 @@ function forwardableResponseHeaders(fetchHeaders) {
  * @param config.upstreamOrigin - scheme+host+port of the real backend, e.g. `http://10.204.100.243:1234` (no path).
  * @param config.maxImagesPerRequest - images kept per forwarded request.
  * @param config.models - model ids to cap; every other model is forwarded completely untouched. Empty/omitted caps every model.
+ * @param config.requestTimeoutMs - idle timeout for both response headers and body (reset on every byte received); `0` disables it. Defaults to undici's own 300000ms.
  * @param config.log - optional `(message: string) => void` for routine per-request diagnostics; silent unless supplied.
  * @param config.onError - optional `(message: string) => void` for proxy failures; defaults to `console.error` so real errors are never silent by default.
  * @returns an unstarted `http.Server`; call `.listen()` yourself.
@@ -96,6 +102,13 @@ export function createProxyServer(config) {
   const upstreamOrigin = config.upstreamOrigin.replace(/\/+$/, '')
   const modelFilter = config.models && config.models.length > 0 ? new Set(config.models) : undefined
   const onError = config.onError ?? (message => console.error(message))
+  const requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+  // A dedicated dispatcher so this proxy's timeout never affects any other
+  // fetch() call sharing this Node process (dsh itself, other plugins).
+  const dispatcher = new Agent({
+    headersTimeout: requestTimeoutMs,
+    bodyTimeout: requestTimeoutMs,
+  })
 
   return http.createServer((req, res) => {
     void (async () => {
@@ -128,6 +141,7 @@ export function createProxyServer(config) {
           method: req.method,
           headers: forwardableRequestHeaders(req.headers, forwardBody?.length),
           body: forwardBody,
+          dispatcher,
         })
 
         res.writeHead(upstreamResponse.status, forwardableResponseHeaders(upstreamResponse.headers))
@@ -135,10 +149,21 @@ export function createProxyServer(config) {
           res.end()
           return
         }
-        Readable.fromWeb(upstreamResponse.body).pipe(res)
+        // pipeline (unlike .pipe()) surfaces a mid-stream failure — e.g. the
+        // upstream going idle past requestTimeoutMs — as a rejection here,
+        // instead of an uncaught 'error' event that would crash the process.
+        await pipeline(Readable.fromWeb(upstreamResponse.body), res)
       } catch (error) {
         onError(`vision-3090-fix: proxy error for ${targetUrl}: ${error.message}`)
-        if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' })
+        if (res.headersSent) {
+          // The response is already committed (status/headers, maybe partial
+          // body) — the best we can do is stop cleanly. The client sees a
+          // truncated response, which is the correct, honest outcome for a
+          // failure partway through streaming.
+          res.destroy()
+          return
+        }
+        res.writeHead(502, { 'content-type': 'application/json' })
         res.end(JSON.stringify({
           error: { message: `vision-3090-fix proxy error: ${error.message}`, code: 'PROXY_ERROR' },
         }))

@@ -76,6 +76,7 @@ Everything else — credentials, model list, `agent-default-model`, the Web UI's
 | `maxImagesPerRequest` | `1` | Images kept per forwarded request; excess (oldest first) becomes placeholder text |
 | `models` | `[]` (every model) | Model ids the cap applies to (matched against the request's `model` field); every other model is forwarded byte-for-byte untouched |
 | `verbose` | `false` | Log the startup banner and each request that gets capped. Actual proxy errors (e.g. the upstream is unreachable) are always logged regardless — they aren't routine noise. |
+| `requestTimeoutMs` | `300000` | Idle timeout for the upstream response (headers and body; reset on every byte received). `0` disables it — useful for a reasoning model whose responses can pause for a long time. A timeout ends that one request and is logged; it never crashes the proxy. |
 
 ## Testing
 

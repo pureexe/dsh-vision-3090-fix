@@ -39,6 +39,14 @@ export const Config = Schema.object({
   models: Schema.array(Schema.string()).default([]),
   /** Log the startup banner and each request that gets capped. Actual proxy errors are always logged regardless. */
   verbose: Schema.boolean().default(false),
+  /**
+   * Idle timeout in ms for the upstream response (headers and body; reset on
+   * every byte received) — matches undici's own default. `0` disables it,
+   * useful for a reasoning model whose responses can pause for a long time. A
+   * timeout is reported through `onError`/console.error and ends that one
+   * request cleanly; it never crashes the proxy.
+   */
+  requestTimeoutMs: Schema.number().min(0).default(300_000),
 })
 
 /**
